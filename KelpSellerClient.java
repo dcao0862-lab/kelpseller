@@ -41,18 +41,18 @@ public class KelpSellerClient implements ClientModInitializer {
     // ===== CẤU HÌNH =====
     static final String ORDER_COMMAND = "order kelp"; // lệnh mở menu đơn hàng (không có dấu /)
     static final int ORDER_SLOT = 0;                  // ô đơn hàng đầu tiên (giá cao nhất)
-    static final int CONFIRM_SLOT = -1;               // -1 = đóng menu để giao; hoặc số ô của nút xác nhận
+    static final int CONFIRM_SLOT = 16;               // ô xanh "xác nhận giao hàng" (hàng 2, cột 8 của khung 3 hàng)
     static final double REACH = 4.0;                  // bán kính tìm rương quanh người chơi
     static final int TIMEOUT = 80;                    // tick chờ menu mở (20 tick = 1 giây)
     // =====================
 
-    enum State { START, NEXT_CHEST, WAIT_CHEST, TAKE, SEND_CMD, WAIT_ORDERS, CLICK_ORDER, WAIT_DELIVER, DEPOSIT, CONFIRM }
+    enum State { START, NEXT_CHEST, WAIT_CHEST, TAKE, SEND_CMD, WAIT_ORDERS, CLICK_ORDER, WAIT_DELIVER, DEPOSIT, CLOSE_DEPOSIT, WAIT_CONFIRM, CLICK_CONFIRM }
 
     private final Random rng = new Random();
     private final Deque<BlockPos> chests = new ArrayDeque<>();
     private final Set<BlockPos> visited = new HashSet<>();
     private boolean running = false;
-    private boolean confirmClicked = false;
+    private boolean checkLeftover = false;
     private State state = State.START;
     private int wait = 0, timeout = 0, lastSyncId = -1, curSyncId = -1;
 
@@ -71,6 +71,7 @@ public class KelpSellerClient implements ClientModInitializer {
         running = !running;
         state = State.START;
         wait = 0;
+        checkLeftover = false;
         say(mc, running ? "KelpSeller: BẬT" : "KelpSeller: TẮT");
     }
 
@@ -141,6 +142,10 @@ public class KelpSellerClient implements ClientModInitializer {
 
         switch (state) {
             case START -> {
+                if (checkLeftover) {
+                    checkLeftover = false;
+                    if (hasKelp(p)) { stop(mc, "kelp vẫn còn trong túi (đơn có thể đã đầy)"); return; }
+                }
                 scanChests(mc);
                 state = State.NEXT_CHEST;
             }
@@ -205,21 +210,27 @@ public class KelpSellerClient implements ClientModInitializer {
             case DEPOSIT -> {
                 if (h == null || h.syncId != curSyncId) { stop(mc, "khung giao hàng bị đóng"); return; }
                 int slot = findKelp(h, false);
-                if (slot < 0) { wait = 10; state = State.CONFIRM; return; }
+                if (slot < 0) { wait = 10; state = State.CLOSE_DEPOSIT; return; }
                 mc.interactionManager.clickSlot(h.syncId, slot, 0, SlotActionType.QUICK_MOVE, p);
                 wait = delay();
             }
-            case CONFIRM -> {
-                if (h != null && CONFIRM_SLOT >= 0 && !confirmClicked) {
-                    mc.interactionManager.clickSlot(h.syncId, CONFIRM_SLOT, 0, SlotActionType.PICKUP, p);
-                    confirmClicked = true;
-                    wait = 10;
-                    return;
-                }
-                confirmClicked = false;
+            case CLOSE_DEPOSIT -> {
+                // đóng khung bỏ đồ, server sẽ mở khung "xác nhận giao hàng"
+                lastSyncId = (h != null) ? h.syncId : curSyncId;
                 p.closeHandledScreen();
-                wait = 40; // đợi server trả tiền
-                if (hasKelp(p)) { stop(mc, "kelp vẫn còn trong túi (đơn có thể đã đầy)"); return; }
+                timeout = TIMEOUT;
+                state = State.WAIT_CONFIRM;
+            }
+            case WAIT_CONFIRM -> {
+                if (h != null && h.syncId != lastSyncId) { curSyncId = h.syncId; wait = 10; state = State.CLICK_CONFIRM; }
+                else if (--timeout <= 0) stop(mc, "không thấy khung xác nhận giao hàng");
+            }
+            case CLICK_CONFIRM -> {
+                if (h == null || h.syncId != curSyncId) { stop(mc, "khung xác nhận bị đóng"); return; }
+                mc.interactionManager.clickSlot(h.syncId, CONFIRM_SLOT, 0, SlotActionType.PICKUP, p);
+                wait = 30; // đợi server trả tiền rồi mới kiểm tra
+                if (mc.currentScreen != null) p.closeHandledScreen();
+                checkLeftover = true;
                 state = State.START;
             }
         }
