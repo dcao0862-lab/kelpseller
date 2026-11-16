@@ -1,8 +1,8 @@
 package com.kelpseller;
 
 // Mod Fabric (client-only) cho Minecraft Java 1.21.11, mappings Yarn.
-// Bật/tắt bằng lệnh /kelpseller trong chat.
-// CHƯA ĐƯỢC BIÊN DỊCH/CHẠY THỬ.
+// Bật/tắt bằng lệnh /kelpseller trong chat. Mod chạy liên tục cho tới khi bạn tắt.
+// CHƯA ĐƯỢC BIÊN DỊCH/CHẠY THỬ trong game.
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
@@ -41,20 +41,26 @@ public class KelpSellerClient implements ClientModInitializer {
     // ===== CẤU HÌNH =====
     static final String ORDER_COMMAND = "order kelp"; // lệnh mở menu đơn hàng (không có dấu /)
     static final int ORDER_SLOT = 0;                  // ô đơn hàng đầu tiên (giá cao nhất)
-    static final int CONFIRM_SLOT = 16;               // ô xanh "xác nhận giao hàng" (hàng 2, cột 8 của khung 3 hàng)
-    static final double REACH = 4.0;                  // bán kính tìm rương quanh người chơi
-    static final int TIMEOUT = 80;                    // tick chờ menu mở (20 tick = 1 giây)
+    static final int CONFIRM_SLOT = 16;               // ô xanh "xác nhận giao hàng"
+    static final double REACH = 4.5;                  // bán kính tìm rương quanh người chơi
+    static final int TIMEOUT = 200;                   // tick chờ một menu mở (20 tick = 1 giây)
+    static final int IDLE_TICKS = 100;                // nghỉ 5 giây khi rương chưa có kelp, rồi quét lại
+    static final int MAX_FAILS = 10;                  // chỉ tự tắt sau ngần này lỗi liên tiếp
     // =====================
 
-    enum State { START, NEXT_CHEST, WAIT_CHEST, TAKE, SEND_CMD, WAIT_ORDERS, CLICK_ORDER, WAIT_DELIVER, DEPOSIT, CLOSE_DEPOSIT, WAIT_CONFIRM, CLICK_CONFIRM }
+    enum State { START, NEXT_CHEST, OPEN_CHEST, WAIT_CHEST, TAKE, SEND_CMD, WAIT_ORDERS, CLICK_ORDER,
+                 WAIT_DELIVER, DEPOSIT, CLOSE_DEPOSIT, WAIT_CONFIRM, CLICK_CONFIRM }
 
     private final Random rng = new Random();
     private final Deque<BlockPos> chests = new ArrayDeque<>();
     private final Set<BlockPos> visited = new HashSet<>();
     private boolean running = false;
     private boolean checkLeftover = false;
+    private boolean idleLogged = false;
     private State state = State.START;
     private int wait = 0, timeout = 0, lastSyncId = -1, curSyncId = -1;
+    private int fails = 0, leftoverRounds = 0, scanned = 0, openedThisRound = 0;
+    private BlockPos target;
 
     @Override
     public void onInitializeClient() {
@@ -71,18 +77,38 @@ public class KelpSellerClient implements ClientModInitializer {
         running = !running;
         state = State.START;
         wait = 0;
+        fails = 0;
+        leftoverRounds = 0;
         checkLeftover = false;
-        say(mc, running ? "KelpSeller: BẬT" : "KelpSeller: TẮT");
+        idleLogged = false;
+        log(mc, running ? "BẬT (gõ /kelpseller để tắt)" : "TẮT");
     }
 
     private void stop(MinecraftClient mc, String why) {
         running = false;
         if (mc.player != null && mc.currentScreen != null) mc.player.closeHandledScreen();
-        say(mc, "KelpSeller dừng: " + why);
+        log(mc, "DỪNG: " + why);
     }
 
-    private void say(MinecraftClient mc, String msg) {
-        if (mc.player != null) mc.player.sendMessage(Text.literal(msg), true);
+    /** Lỗi tạm thời: đóng menu, đợi 3 giây rồi làm lại từ đầu. Chỉ tắt khi lỗi liên tiếp quá nhiều. */
+    private void fail(MinecraftClient mc, String why) {
+        if (mc.player != null && mc.currentScreen != null) mc.player.closeHandledScreen();
+        fails++;
+        if (fails >= MAX_FAILS) { stop(mc, why + " (lỗi liên tiếp " + fails + " lần)"); return; }
+        log(mc, "Lỗi: " + why + ", thử lại (" + fails + "/" + MAX_FAILS + ")");
+        wait = 60;
+        state = State.START;
+    }
+
+    /** Không có việc gì: nghỉ rồi quét rương lại, KHÔNG tắt. */
+    private void idle(MinecraftClient mc, String why) {
+        if (!idleLogged) { log(mc, why); idleLogged = true; }
+        wait = IDLE_TICKS;
+        state = State.START;
+    }
+
+    private void log(MinecraftClient mc, String msg) {
+        if (mc.player != null) mc.player.sendMessage(Text.literal("[KelpSeller] " + msg), false);
     }
 
     private int delay() { return 3 + rng.nextInt(4); } // 3-6 tick giữa các thao tác
@@ -131,6 +157,15 @@ public class KelpSellerClient implements ClientModInitializer {
                 }
         found.sort(Comparator.comparingDouble(p -> Vec3d.ofCenter(p).squaredDistanceTo(eye)));
         chests.addAll(found);
+        scanned = found.size();
+    }
+
+    /** Quay đầu nhìn vào rương như người chơi thật. */
+    private void aimAt(ClientPlayerEntity p, BlockPos pos) {
+        Vec3d d = Vec3d.ofCenter(pos).subtract(p.getEyePos());
+        double flat = Math.sqrt(d.x * d.x + d.z * d.z);
+        p.setYaw((float) Math.toDegrees(Math.atan2(-d.x, d.z)));
+        p.setPitch((float) -Math.toDegrees(Math.atan2(d.y, flat)));
     }
 
     private void tick(MinecraftClient mc) {
@@ -144,15 +179,27 @@ public class KelpSellerClient implements ClientModInitializer {
             case START -> {
                 if (checkLeftover) {
                     checkLeftover = false;
-                    if (hasKelp(p)) { stop(mc, "kelp vẫn còn trong túi (đơn có thể đã đầy)"); return; }
+                    if (hasKelp(p)) {
+                        leftoverRounds++;
+                        if (leftoverRounds >= 3) { stop(mc, "kelp vẫn còn trong túi sau 3 lần giao (đơn có thể đã đầy)"); return; }
+                        log(mc, "Còn kelp trong túi, giao lại");
+                        state = State.SEND_CMD;
+                        return;
+                    }
+                    leftoverRounds = 0;
                 }
+                openedThisRound = 0;
                 scanChests(mc);
                 state = State.NEXT_CHEST;
             }
             case NEXT_CHEST -> {
-                if (inventoryFull(p) || chests.isEmpty()) {
-                    if (hasKelp(p)) state = State.SEND_CMD;
-                    else stop(mc, "không còn kelp trong rương");
+                boolean full = inventoryFull(p);
+                if (full || chests.isEmpty()) {
+                    if (hasKelp(p)) { state = State.SEND_CMD; return; }
+                    if (full) { idle(mc, "Túi đầy nhưng không có kelp, hãy dọn túi"); return; }
+                    if (scanned == 0) { idle(mc, "Không thấy rương nào trong " + REACH + " ô quanh bạn, hãy đứng gần rương hơn"); return; }
+                    if (openedThisRound == 0) { fail(mc, "không mở được rương nào (xa quá hoặc bị chặn)"); return; }
+                    idle(mc, "Rương chưa có kelp, đang đợi farm bổ sung");
                     return;
                 }
                 BlockPos pos = chests.poll();
@@ -164,13 +211,19 @@ public class KelpSellerClient implements ClientModInitializer {
                         && st.get(ChestBlock.CHEST_TYPE) != ChestType.SINGLE) {
                     visited.add(pos.offset(ChestBlock.getFacing(st)));
                 }
-                BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
+                target = pos;
+                aimAt(p, pos);
+                wait = 3; // đợi gói quay đầu được gửi lên server
+                state = State.OPEN_CHEST;
+            }
+            case OPEN_CHEST -> {
+                BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(target), Direction.UP, target, false);
                 mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
                 timeout = TIMEOUT;
                 state = State.WAIT_CHEST;
             }
             case WAIT_CHEST -> {
-                if (h != null) { curSyncId = h.syncId; wait = delay(); state = State.TAKE; }
+                if (h != null) { curSyncId = h.syncId; openedThisRound++; wait = delay(); state = State.TAKE; }
                 else if (--timeout <= 0) state = State.NEXT_CHEST; // rương không mở được, qua rương khác
             }
             case TAKE -> {
@@ -182,6 +235,7 @@ public class KelpSellerClient implements ClientModInitializer {
                     state = State.NEXT_CHEST;
                     return;
                 }
+                idleLogged = false;
                 mc.interactionManager.clickSlot(h.syncId, slot, 0, SlotActionType.QUICK_MOVE, p);
                 wait = delay();
             }
@@ -194,10 +248,10 @@ public class KelpSellerClient implements ClientModInitializer {
             }
             case WAIT_ORDERS -> {
                 if (h != null && h.syncId != lastSyncId) { curSyncId = h.syncId; wait = 10; state = State.CLICK_ORDER; }
-                else if (--timeout <= 0) stop(mc, "không mở được menu đơn hàng");
+                else if (--timeout <= 0) fail(mc, "không mở được menu đơn hàng");
             }
             case CLICK_ORDER -> {
-                if (h == null || h.syncId != curSyncId) { stop(mc, "menu đơn hàng bị đóng"); return; }
+                if (h == null || h.syncId != curSyncId) { fail(mc, "menu đơn hàng bị đóng hoặc làm mới"); return; }
                 lastSyncId = h.syncId;
                 mc.interactionManager.clickSlot(h.syncId, ORDER_SLOT, 0, SlotActionType.PICKUP, p);
                 timeout = TIMEOUT;
@@ -205,10 +259,10 @@ public class KelpSellerClient implements ClientModInitializer {
             }
             case WAIT_DELIVER -> {
                 if (h != null && h.syncId != lastSyncId) { curSyncId = h.syncId; wait = 10; state = State.DEPOSIT; }
-                else if (--timeout <= 0) stop(mc, "không mở được khung giao hàng");
+                else if (--timeout <= 0) fail(mc, "không mở được khung giao hàng");
             }
             case DEPOSIT -> {
-                if (h == null || h.syncId != curSyncId) { stop(mc, "khung giao hàng bị đóng"); return; }
+                if (h == null || h.syncId != curSyncId) { fail(mc, "khung giao hàng bị đóng"); return; }
                 int slot = findKelp(h, false);
                 if (slot < 0) { wait = 10; state = State.CLOSE_DEPOSIT; return; }
                 mc.interactionManager.clickSlot(h.syncId, slot, 0, SlotActionType.QUICK_MOVE, p);
@@ -223,11 +277,13 @@ public class KelpSellerClient implements ClientModInitializer {
             }
             case WAIT_CONFIRM -> {
                 if (h != null && h.syncId != lastSyncId) { curSyncId = h.syncId; wait = 10; state = State.CLICK_CONFIRM; }
-                else if (--timeout <= 0) stop(mc, "không thấy khung xác nhận giao hàng");
+                else if (--timeout <= 0) fail(mc, "không thấy khung xác nhận giao hàng");
             }
             case CLICK_CONFIRM -> {
-                if (h == null || h.syncId != curSyncId) { stop(mc, "khung xác nhận bị đóng"); return; }
+                if (h == null || h.syncId != curSyncId) { fail(mc, "khung xác nhận bị đóng"); return; }
                 mc.interactionManager.clickSlot(h.syncId, CONFIRM_SLOT, 0, SlotActionType.PICKUP, p);
+                fails = 0;
+                idleLogged = false;
                 wait = 30; // đợi server trả tiền rồi mới kiểm tra
                 if (mc.currentScreen != null) p.closeHandledScreen();
                 checkLeftover = true;
