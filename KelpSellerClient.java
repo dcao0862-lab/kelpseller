@@ -23,9 +23,10 @@ import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -43,24 +44,26 @@ public class KelpSellerClient implements ClientModInitializer {
     static final int ORDER_SLOT = 0;                  // ô đơn hàng đầu tiên (giá cao nhất)
     static final int CONFIRM_SLOT = 16;               // ô xanh "xác nhận giao hàng"
     static final double REACH = 4.5;                  // bán kính tìm rương quanh người chơi
-    static final int TIMEOUT = 200;                   // tick chờ một menu mở (20 tick = 1 giây)
-    static final int IDLE_TICKS = 100;                // nghỉ 5 giây khi rương chưa có kelp, rồi quét lại
+    static final int TIMEOUT = 200;                   // tick chờ một menu đơn hàng mở (20 tick = 1 giây)
+    static final int OPEN_TIMEOUT = 40;               // tick chờ một rương mở (2 giây)
+    static final int IDLE_TICKS = 0;                  // nghỉ giữa các vòng quét rương (0 = quét liên tục)
     static final int MAX_FAILS = 10;                  // chỉ tự tắt sau ngần này lỗi liên tiếp
     // =====================
 
     enum State { START, NEXT_CHEST, OPEN_CHEST, WAIT_CHEST, TAKE, SEND_CMD, WAIT_ORDERS, CLICK_ORDER,
-                 WAIT_DELIVER, DEPOSIT, CLOSE_DEPOSIT, WAIT_CONFIRM, CLICK_CONFIRM }
+                 WAIT_DELIVER, DEPOSIT, CLOSE_DEPOSIT, WAIT_CONFIRM, CLICK_CONFIRM, AFTER_CONFIRM }
 
     private final Random rng = new Random();
     private final Deque<BlockPos> chests = new ArrayDeque<>();
     private final Set<BlockPos> visited = new HashSet<>();
+    private final Set<BlockPos> hiddenLogged = new HashSet<>();
     private boolean running = false;
     private boolean checkLeftover = false;
     private boolean idleLogged = false;
     private State state = State.START;
     private int wait = 0, timeout = 0, lastSyncId = -1, curSyncId = -1;
     private int fails = 0, leftoverRounds = 0, scanned = 0, openedThisRound = 0;
-    private BlockPos target;
+    private BlockHitResult pendingHit;
     private double rx = 1, rz = 0; // hướng "bên phải" của bạn lúc bật mod (cố định, làm tròn theo 4 hướng)
 
     @Override
@@ -82,6 +85,7 @@ public class KelpSellerClient implements ClientModInitializer {
         leftoverRounds = 0;
         checkLeftover = false;
         idleLogged = false;
+        hiddenLogged.clear();
         if (running && mc.player != null) {
             // Khóa hướng nhìn lúc bật: "phải" và "trái" tính theo hướng này, không đổi khi nhân vật quay đầu
             int snapped = Math.round(mc.player.getYaw() / 90.0f) * 90;
@@ -110,10 +114,10 @@ public class KelpSellerClient implements ClientModInitializer {
         state = State.START;
     }
 
-    /** Không có việc gì: nghỉ rồi quét rương lại, KHÔNG tắt. */
-    private void idle(MinecraftClient mc, String why) {
+    /** Không có việc gì: quét rương lại ngay (hoặc sau minTicks), KHÔNG tắt. */
+    private void idle(MinecraftClient mc, String why, int minTicks) {
         if (!idleLogged) { log(mc, why); idleLogged = true; }
-        wait = IDLE_TICKS;
+        wait = Math.max(IDLE_TICKS, minTicks);
         state = State.START;
     }
 
@@ -138,6 +142,13 @@ public class KelpSellerClient implements ClientModInitializer {
             if (s.isEmpty() || (isKelp(s) && s.getCount() < s.getMaxCount())) return false;
         }
         return true;
+    }
+
+    /** Màn hình đang mở có phải rương/thùng thật không (tiêu đề "Large Chest", "Chest", "Barrel"). */
+    private static boolean isStorage(MinecraftClient mc) {
+        if (mc.currentScreen == null) return false;
+        String t = mc.currentScreen.getTitle().getString().toLowerCase();
+        return t.contains("chest") || t.contains("barrel") || t.contains("rương") || t.contains("thùng");
     }
 
     /** Tìm ô chứa kelp: inChest=true tìm trong phần rương, false tìm trong túi đồ người chơi. */
@@ -174,9 +185,36 @@ public class KelpSellerClient implements ClientModInitializer {
         scanned = found.size();
     }
 
-    /** Quay đầu nhìn vào rương như người chơi thật. */
-    private void aimAt(ClientPlayerEntity p, BlockPos pos) {
-        Vec3d d = Vec3d.ofCenter(pos).subtract(p.getEyePos());
+    /**
+     * Tìm một điểm trên rương mà tia nhìn thật từ mắt bạn chạm đúng rương đó (không bị rương/khối khác che).
+     * Trả về chính cú nhấp phải mà người chơi thật sẽ tạo ra (đúng mặt, đúng vị trí). null nếu không có điểm nào.
+     */
+    private BlockHitResult findVisibleHit(MinecraftClient mc, ClientPlayerEntity p, BlockPos pos, BlockPos partner) {
+        Vec3d eye = p.getEyePos();
+        double[][] offs = {
+                {0.5, 0.45, 0.5}, {0.5, 0.8, 0.5}, {0.5, 0.15, 0.5},
+                {0.25, 0.45, 0.5}, {0.75, 0.45, 0.5}, {0.5, 0.45, 0.25}, {0.5, 0.45, 0.75},
+                {0.2, 0.8, 0.2}, {0.8, 0.8, 0.8}, {0.2, 0.15, 0.8}, {0.8, 0.15, 0.2}
+        };
+        for (double[] o : offs) {
+            Vec3d pt = new Vec3d(pos.getX() + o[0], pos.getY() + o[1], pos.getZ() + o[2]);
+            Vec3d dir = pt.subtract(eye);
+            if (dir.length() < 0.01) continue;
+            Vec3d end = eye.add(dir.normalize().multiply(REACH + 1.0));
+            BlockHitResult r = mc.world.raycast(new RaycastContext(
+                    eye, end, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, p));
+            if (r.getType() != HitResult.Type.BLOCK) continue;
+            BlockPos hp = r.getBlockPos();
+            if ((hp.equals(pos) || (partner != null && hp.equals(partner))) && eye.distanceTo(r.getPos()) <= REACH) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    /** Quay đầu nhìn vào điểm đó như người chơi thật. */
+    private void aimAt(ClientPlayerEntity p, Vec3d point) {
+        Vec3d d = point.subtract(p.getEyePos());
         double flat = Math.sqrt(d.x * d.x + d.z * d.z);
         p.setYaw((float) Math.toDegrees(Math.atan2(-d.x, d.z)));
         p.setPitch((float) -Math.toDegrees(Math.atan2(d.y, flat)));
@@ -191,6 +229,8 @@ public class KelpSellerClient implements ClientModInitializer {
 
         switch (state) {
             case START -> {
+                // Luôn đóng mọi menu còn sót (ví dụ menu đơn hàng server tự mở lại) trước khi quét rương
+                if (mc.currentScreen != null) { p.closeHandledScreen(); wait = 5; return; }
                 if (checkLeftover) {
                     checkLeftover = false;
                     if (hasKelp(p)) {
@@ -207,41 +247,60 @@ public class KelpSellerClient implements ClientModInitializer {
                 state = State.NEXT_CHEST;
             }
             case NEXT_CHEST -> {
+                if (mc.currentScreen != null) { p.closeHandledScreen(); wait = 5; return; }
                 boolean full = inventoryFull(p);
                 if (full || chests.isEmpty()) {
                     if (hasKelp(p)) { state = State.SEND_CMD; return; }
-                    if (full) { idle(mc, "Túi đầy nhưng không có kelp, hãy dọn túi"); return; }
-                    if (scanned == 0) { idle(mc, "Không thấy rương nào trong " + REACH + " ô quanh bạn, hãy đứng gần rương hơn"); return; }
-                    if (openedThisRound == 0) { fail(mc, "không mở được rương nào (xa quá hoặc bị chặn)"); return; }
-                    idle(mc, "Rương chưa có kelp, đang đợi farm bổ sung");
+                    if (full) { idle(mc, "Túi đầy nhưng không có kelp, hãy dọn túi", 40); return; }
+                    if (scanned == 0) { idle(mc, "Không thấy rương nào trong " + REACH + " ô quanh bạn, hãy đứng gần rương hơn", 40); return; }
+                    if (openedThisRound == 0) { idle(mc, "Không mở được rương nào (xa quá hoặc bị che), hãy đứng gần hơn", 40); return; }
+                    idle(mc, "Rương chưa có kelp, đang đợi farm bổ sung", 0);
                     return;
                 }
                 BlockPos pos = chests.poll();
                 if (visited.contains(pos)) return;
                 BlockState st = mc.world.getBlockState(pos);
                 visited.add(pos);
+                BlockPos partner = null;
                 // rương đôi: đánh dấu luôn nửa còn lại để không mở lại
                 if (st.getBlock() instanceof ChestBlock && st.contains(ChestBlock.CHEST_TYPE)
                         && st.get(ChestBlock.CHEST_TYPE) != ChestType.SINGLE) {
-                    visited.add(pos.offset(ChestBlock.getFacing(st)));
+                    partner = pos.offset(ChestBlock.getFacing(st));
+                    visited.add(partner);
                 }
-                target = pos;
-                aimAt(p, pos);
+                BlockHitResult hit = findVisibleHit(mc, p, pos, partner);
+                if (hit == null) {
+                    if (hiddenLogged.add(pos))
+                        log(mc, "Rương (" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ") bị che hoặc quá xa, bỏ qua");
+                    return;
+                }
+                pendingHit = hit;
+                aimAt(p, hit.getPos());
+                lastSyncId = p.currentScreenHandler.syncId;
                 wait = 3; // đợi gói quay đầu được gửi lên server
                 state = State.OPEN_CHEST;
             }
             case OPEN_CHEST -> {
-                BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(target), Direction.UP, target, false);
-                mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
-                timeout = TIMEOUT;
+                mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, pendingHit);
+                timeout = OPEN_TIMEOUT;
                 state = State.WAIT_CHEST;
             }
             case WAIT_CHEST -> {
-                if (h != null) { curSyncId = h.syncId; openedThisRound++; wait = delay(); state = State.TAKE; }
-                else if (--timeout <= 0) state = State.NEXT_CHEST; // rương không mở được, qua rương khác
+                if (h != null) {
+                    if (h.syncId == lastSyncId || !isStorage(mc)) { // không phải rương, đóng lại để khỏi bấm nhầm
+                        p.closeHandledScreen();
+                        wait = 5;
+                        state = State.NEXT_CHEST;
+                        return;
+                    }
+                    curSyncId = h.syncId;
+                    openedThisRound++;
+                    wait = delay();
+                    state = State.TAKE;
+                } else if (--timeout <= 0) state = State.NEXT_CHEST; // rương không mở được, qua rương khác
             }
             case TAKE -> {
-                if (h == null || h.syncId != curSyncId) { state = State.NEXT_CHEST; return; }
+                if (h == null || h.syncId != curSyncId || !isStorage(mc)) { state = State.NEXT_CHEST; return; }
                 int slot = findKelp(h, true);
                 if (slot < 0 || inventoryFull(p)) {
                     p.closeHandledScreen();
@@ -298,8 +357,13 @@ public class KelpSellerClient implements ClientModInitializer {
                 mc.interactionManager.clickSlot(h.syncId, CONFIRM_SLOT, 0, SlotActionType.PICKUP, p);
                 fails = 0;
                 idleLogged = false;
-                wait = 30; // đợi server trả tiền rồi mới kiểm tra
+                wait = 10; // cho server xử lý xác nhận
+                state = State.AFTER_CONFIRM;
+            }
+            case AFTER_CONFIRM -> {
+                // đóng mọi menu còn mở sau khi bán (kể cả menu server tự mở lại), rồi kiểm tra kelp còn dư
                 if (mc.currentScreen != null) p.closeHandledScreen();
+                wait = 20;
                 checkLeftover = true;
                 state = State.START;
             }
