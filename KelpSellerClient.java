@@ -61,6 +61,7 @@ public class KelpSellerClient implements ClientModInitializer {
     private int wait = 0, timeout = 0, lastSyncId = -1, curSyncId = -1;
     private int fails = 0, leftoverRounds = 0, scanned = 0, openedThisRound = 0;
     private BlockPos target;
+    private double rx = 1, rz = 0; // hướng "bên phải" của bạn lúc bật mod (cố định, làm tròn theo 4 hướng)
 
     @Override
     public void onInitializeClient() {
@@ -81,7 +82,16 @@ public class KelpSellerClient implements ClientModInitializer {
         leftoverRounds = 0;
         checkLeftover = false;
         idleLogged = false;
-        log(mc, running ? "BẬT (gõ /kelpseller để tắt)" : "TẮT");
+        if (running && mc.player != null) {
+            // Khóa hướng nhìn lúc bật: "phải" và "trái" tính theo hướng này, không đổi khi nhân vật quay đầu
+            int snapped = Math.round(mc.player.getYaw() / 90.0f) * 90;
+            double rad = Math.toRadians(snapped);
+            rx = -Math.cos(rad);
+            rz = -Math.sin(rad);
+            if (Math.abs(rx) < 1e-6) rx = 0;
+            if (Math.abs(rz) < 1e-6) rz = 0;
+        }
+        log(mc, running ? "BẬT: kiểm tra rương từ trên xuống dưới, từ phải sang trái (theo hướng bạn đang nhìn). Gõ /kelpseller để tắt" : "TẮT");
     }
 
     private void stop(MinecraftClient mc, String why) {
@@ -155,7 +165,11 @@ public class KelpSellerClient implements ClientModInitializer {
                     if (st.isOf(Blocks.CHEST) || st.isOf(Blocks.TRAPPED_CHEST) || st.isOf(Blocks.BARREL))
                         found.add(p.toImmutable());
                 }
-        found.sort(Comparator.comparingDouble(p -> Vec3d.ofCenter(p).squaredDistanceTo(eye)));
+        // Thứ tự: hàng trên cùng trước; trong mỗi hàng đi từ phải sang trái; hòa thì rương gần hơn trước
+        found.sort(Comparator
+                .comparingInt((BlockPos b) -> -b.getY())
+                .thenComparingDouble(b -> -((b.getX() + 0.5) * rx + (b.getZ() + 0.5) * rz))
+                .thenComparingDouble(b -> Vec3d.ofCenter(b).squaredDistanceTo(eye)));
         chests.addAll(found);
         scanned = found.size();
     }
